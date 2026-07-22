@@ -121,6 +121,46 @@ router.get('/verify/:reference', async (req, res) => {
   }
 });
 
+// Admin: reconcile pending payments — checks every 'pending' vote directly against Paystack
+// and updates its status. Fixes cases where the webhook never reached the backend even
+// though the payment actually succeeded on Paystack's side.
+router.post('/admin/reconcile-pending', requireAdmin, async (req, res) => {
+  try {
+    const { rows: pendingVotes } = await pool.query(
+      `SELECT id, payment_ref FROM votes WHERE status = 'pending' ORDER BY created_at ASC`
+    );
+
+    const results = { checked: pendingVotes.length, confirmed: 0, stillPending: 0, failed: 0, errors: [] };
+
+    for (const vote of pendingVotes) {
+      try {
+        const paystackRes = await axios.get(
+          `https://api.paystack.co/transaction/verify/${vote.payment_ref}`,
+          { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` } }
+        );
+        const status = paystackRes.data.data.status;
+
+        if (status === 'success') {
+          await pool.query(`UPDATE votes SET status = 'success' WHERE id = $1`, [vote.id]);
+          results.confirmed++;
+        } else if (status === 'failed' || status === 'abandoned') {
+          await pool.query(`UPDATE votes SET status = 'failed' WHERE id = $1`, [vote.id]);
+          results.failed++;
+        } else {
+          results.stillPending++;
+        }
+      } catch (err) {
+        results.errors.push({ payment_ref: vote.payment_ref, error: err.response?.data?.message || err.message });
+      }
+    }
+
+    res.json(results);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to reconcile pending payments' });
+  }
+});
+
 // Admin: view all vote transactions
 router.get('/admin/all', requireAdmin, async (req, res) => {
   try {
