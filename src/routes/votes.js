@@ -1,205 +1,57 @@
-// const express = require('express');
-// const router = express.Router();
-// const axios = require('axios');
-// const crypto = require('crypto');
-// const pool = require('../db/pool');
-// const requireAdmin = require('../middleware/requireAdmin');
-
-// const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
-
-// // Helper: get current price per vote (in kobo) from settings table
-// async function getPricePerVote() {
-//   const { rows } = await pool.query("SELECT value FROM settings WHERE key = 'price_per_vote_kobo'");
-//   return rows.length ? parseInt(rows[0].value, 10) : 10000; // default ₦100
-// }
-
-// // Public: initiate a vote purchase -> returns Paystack authorization_url (or use Paystack Inline on frontend)
-// router.post('/initiate', async (req, res) => {
-//   const { nominee_id, vote_count, voter_name, voter_phone, voter_email } = req.body;
-
-//   if (!nominee_id || !vote_count || vote_count < 1) {
-//     return res.status(400).json({ error: 'nominee_id and vote_count (>=1) are required' });
-//   }
-//   if (!voter_email) {
-//     return res.status(400).json({ error: 'voter_email is required (Paystack requires an email)' });
-//   }
-
-//   try {
-//     const pricePerVote = await getPricePerVote();
-//     const amount = pricePerVote * vote_count; // kobo
-//     const reference = `vote_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-
-//     // Record a pending vote row first so we never lose track of the attempt
-//     await pool.query(
-//       `INSERT INTO votes (nominee_id, voter_name, voter_phone, vote_count, amount_paid, payment_ref, status)
-//        VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
-//       [nominee_id, voter_name || null, voter_phone || null, vote_count, amount, reference]
-//     );
-
-//     // Initialize transaction with Paystack
-//     const paystackRes = await axios.post(
-//       'https://api.paystack.co/transaction/initialize',
-//       {
-//         email: voter_email,
-//         amount,
-//         reference,
-//         callback_url: `${process.env.FRONTEND_URL}/payment-success`,
-//         metadata: { nominee_id, vote_count },
-//       },
-//       { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` } }
-//     );
-
-//     res.json({
-//       authorization_url: paystackRes.data.data.authorization_url,
-//       access_code: paystackRes.data.data.access_code,
-//       reference,
-//     });
-//   } catch (err) {
-//     console.error(err.response?.data || err.message);
-//     res.status(500).json({ error: 'Failed to initiate payment' });
-//   }
-// });
-
-// // Paystack webhook: confirms payment and finalizes vote status
-// // IMPORTANT: configure this exact URL in your Paystack dashboard webhook settings
-// router.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
-//   try {
-//     const signature = req.headers['x-paystack-signature'];
-//     const hash = crypto
-//       .createHmac('sha512', PAYSTACK_SECRET)
-//       .update(req.body)
-//       .digest('hex');
-
-//     if (hash !== signature) {
-//       return res.status(401).send('Invalid signature');
-//     }
-
-//     const event = JSON.parse(req.body.toString('utf8'));
-
-//     if (event.event === 'charge.success') {
-//       const { reference } = event.data;
-
-//       // Idempotency: only update if still pending, prevents double-processing on webhook retries
-//       await pool.query(
-//         `UPDATE votes SET status = 'success' WHERE payment_ref = $1 AND status = 'pending'`,
-//         [reference]
-//       );
-//     } else if (event.event === 'charge.failed') {
-//       const { reference } = event.data;
-//       await pool.query(
-//         `UPDATE votes SET status = 'failed' WHERE payment_ref = $1 AND status = 'pending'`,
-//         [reference]
-//       );
-//     }
-
-//     res.sendStatus(200);
-//   } catch (err) {
-//     console.error('Webhook error:', err.message);
-//     res.sendStatus(500);
-//   }
-// });
-
-// // Public: verify a transaction manually (useful right after redirect from Paystack)
-// router.get('/verify/:reference', async (req, res) => {
-//   try {
-//     const paystackRes = await axios.get(
-//       `https://api.paystack.co/transaction/verify/${req.params.reference}`,
-//       { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` } }
-//     );
-
-//     const status = paystackRes.data.data.status; // 'success' | 'failed' | 'abandoned'
-//     if (status === 'success') {
-//       await pool.query(
-//         `UPDATE votes SET status = 'success' WHERE payment_ref = $1 AND status = 'pending'`,
-//         [req.params.reference]
-//       );
-//     }
-//     res.json({ status });
-//   } catch (err) {
-//     console.error(err.response?.data || err.message);
-//     res.status(500).json({ error: 'Failed to verify transaction' });
-//   }
-// });
-
-// // Admin: reconcile pending payments — checks every 'pending' vote directly against Paystack
-// // and updates its status. Fixes cases where the webhook never reached the backend even
-// // though the payment actually succeeded on Paystack's side.
-// router.post('/admin/reconcile-pending', requireAdmin, async (req, res) => {
-//   try {
-//     const { rows: pendingVotes } = await pool.query(
-//       `SELECT id, payment_ref FROM votes WHERE status = 'pending' ORDER BY created_at ASC`
-//     );
-
-//     const results = { checked: pendingVotes.length, confirmed: 0, stillPending: 0, failed: 0, errors: [] };
-
-//     for (const vote of pendingVotes) {
-//       try {
-//         const paystackRes = await axios.get(
-//           `https://api.paystack.co/transaction/verify/${vote.payment_ref}`,
-//           { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` } }
-//         );
-//         const status = paystackRes.data.data.status;
-
-//         if (status === 'success') {
-//           await pool.query(`UPDATE votes SET status = 'success' WHERE id = $1`, [vote.id]);
-//           results.confirmed++;
-//         } else if (status === 'failed' || status === 'abandoned') {
-//           await pool.query(`UPDATE votes SET status = 'failed' WHERE id = $1`, [vote.id]);
-//           results.failed++;
-//         } else {
-//           results.stillPending++;
-//         }
-//       } catch (err) {
-//         results.errors.push({ payment_ref: vote.payment_ref, error: err.response?.data?.message || err.message });
-//       }
-//     }
-
-//     res.json(results);
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).json({ error: 'Failed to reconcile pending payments' });
-//   }
-// });
-
-// // Admin: view all vote transactions
-// router.get('/admin/all', requireAdmin, async (req, res) => {
-//   try {
-//     const { rows } = await pool.query(`
-//       SELECT v.*, n.name AS nominee_name, c.name AS category_name
-//       FROM votes v
-//       JOIN nominees n ON n.id = v.nominee_id
-//       JOIN categories c ON c.id = n.category_id
-//       ORDER BY v.created_at DESC
-//     `);
-//     res.json(rows);
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).json({ error: 'Failed to fetch votes' });
-//   }
-// });
-
-// module.exports = router;
-
-
-
-
-
 const express = require('express');
 const router = express.Router();
-const axios = require('axios');
 const crypto = require('crypto');
 const pool = require('../db/pool');
 const requireAdmin = require('../middleware/requireAdmin');
+const paystack = require('../services/paystack');
+const { getPricePerVoteKobo, getPlatformFeePercent, splitAmount } = require('../services/settings');
+const realtime = require('../lib/realtime');
 
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
 
-// Helper: get current price per vote (in kobo) from settings table
-async function getPricePerVote() {
-  const { rows } = await pool.query("SELECT value FROM settings WHERE key = 'price_per_vote_kobo'");
-  return rows.length ? parseInt(rows[0].value, 10) : 10000; // default ₦100
+// Shared helper: marks a vote as successful, calculates + stores the fee split,
+// and emits a realtime update. Used by the webhook, manual verify, the pending
+// reconciler, and the full reconciler — one place, so the split logic can never
+// drift between the four confirmation paths.
+async function markVoteSuccess({ id = null, paymentRef = null, amountPaid, confirmedVia }) {
+  const feePercent = await getPlatformFeePercent();
+  const { platformFeeKobo, organizerPayoutKobo } = splitAmount(amountPaid, feePercent);
+
+  const whereClause = id ? 'id = $4' : 'payment_ref = $4';
+  const whereValue = id || paymentRef;
+
+  const { rows } = await pool.query(
+    `UPDATE votes
+     SET status = 'success', platform_fee_kobo = $1, organizer_payout_kobo = $2, confirmed_via = $3
+     WHERE ${whereClause} AND status = 'pending'
+     RETURNING *`,
+    [platformFeeKobo, organizerPayoutKobo, confirmedVia, whereValue]
+  );
+
+  if (rows.length) {
+    realtime.emitVoteUpdate(rows[0]);
+    realtime.emitEarningsUpdate();
+  }
+  return rows[0] || null;
 }
 
-// Public: initiate a vote purchase -> returns Paystack authorization_url (or use Paystack Inline on frontend)
+async function markVoteFailed({ id = null, paymentRef = null, reason = null, confirmedVia }) {
+  const whereClause = id ? 'id = $3' : 'payment_ref = $3';
+  const whereValue = id || paymentRef;
+
+  const { rows } = await pool.query(
+    `UPDATE votes
+     SET status = 'failed', failure_reason = $1, confirmed_via = $2
+     WHERE ${whereClause} AND status = 'pending'
+     RETURNING *`,
+    [reason, confirmedVia, whereValue]
+  );
+
+  if (rows.length) realtime.emitVoteUpdate(rows[0]);
+  return rows[0] || null;
+}
+
+// Public: initiate a vote purchase -> returns Paystack authorization_url
 router.post('/initiate', async (req, res) => {
   const { nominee_id, vote_count, voter_name, voter_phone, voter_email } = req.body;
 
@@ -211,7 +63,7 @@ router.post('/initiate', async (req, res) => {
   }
 
   try {
-    const pricePerVote = await getPricePerVote();
+    const pricePerVote = await getPricePerVoteKobo();
     const amount = pricePerVote * vote_count; // kobo
     const reference = `vote_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
 
@@ -222,39 +74,27 @@ router.post('/initiate', async (req, res) => {
       [nominee_id, voter_name || null, voter_phone || null, vote_count, amount, reference]
     );
 
-    // Initialize transaction with Paystack
-    const paystackRes = await axios.post(
-      'https://api.paystack.co/transaction/initialize',
-      {
-        email: voter_email,
-        amount,
-        reference,
-        callback_url: `${process.env.FRONTEND_URL}/payment-success`,
-        metadata: { nominee_id, vote_count },
-      },
-      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` } }
-    );
-
-    res.json({
-      authorization_url: paystackRes.data.data.authorization_url,
-      access_code: paystackRes.data.data.access_code,
+    const { authorization_url, access_code } = await paystack.initializeTransaction({
+      email: voter_email,
+      amount,
       reference,
+      callback_url: `${process.env.FRONTEND_URL}/payment-success`,
+      metadata: { nominee_id, vote_count },
     });
+
+    res.json({ authorization_url, access_code, reference });
   } catch (err) {
     console.error(err.response?.data || err.message);
     res.status(500).json({ error: 'Failed to initiate payment' });
   }
 });
 
-// Paystack webhook: confirms payment and finalizes vote status
+// Paystack webhook: primary, real-time confirmation path.
 // IMPORTANT: configure this exact URL in your Paystack dashboard webhook settings
 router.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   try {
     const signature = req.headers['x-paystack-signature'];
-    const hash = crypto
-      .createHmac('sha512', PAYSTACK_SECRET)
-      .update(req.body)
-      .digest('hex');
+    const hash = crypto.createHmac('sha512', PAYSTACK_SECRET).update(req.body).digest('hex');
 
     if (hash !== signature) {
       return res.status(401).send('Invalid signature');
@@ -263,19 +103,17 @@ router.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
     const event = JSON.parse(req.body.toString('utf8'));
 
     if (event.event === 'charge.success') {
-      const { reference } = event.data;
-
-      // Idempotency: only update if still pending, prevents double-processing on webhook retries
-      await pool.query(
-        `UPDATE votes SET status = 'success' WHERE payment_ref = $1 AND status = 'pending'`,
-        [reference]
-      );
+      await markVoteSuccess({
+        paymentRef: event.data.reference,
+        amountPaid: event.data.amount,
+        confirmedVia: 'webhook',
+      });
     } else if (event.event === 'charge.failed') {
-      const { reference } = event.data;
-      await pool.query(
-        `UPDATE votes SET status = 'failed' WHERE payment_ref = $1 AND status = 'pending'`,
-        [reference]
-      );
+      await markVoteFailed({
+        paymentRef: event.data.reference,
+        reason: event.data.gateway_response || 'Payment failed',
+        confirmedVia: 'webhook',
+      });
     }
 
     res.sendStatus(200);
@@ -285,52 +123,53 @@ router.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   }
 });
 
-// Public: verify a transaction manually (useful right after redirect from Paystack)
+// Public: verify a transaction manually (used right after redirect from Paystack, as a
+// second confirmation path in case the webhook is delayed)
 router.get('/verify/:reference', async (req, res) => {
   try {
-    const paystackRes = await axios.get(
-      `https://api.paystack.co/transaction/verify/${req.params.reference}`,
-      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` } }
-    );
+    const data = await paystack.verifyTransaction(req.params.reference);
 
-    const status = paystackRes.data.data.status; // 'success' | 'failed' | 'abandoned'
-    if (status === 'success') {
-      await pool.query(
-        `UPDATE votes SET status = 'success' WHERE payment_ref = $1 AND status = 'pending'`,
-        [req.params.reference]
-      );
+    if (data.status === 'success') {
+      await markVoteSuccess({
+        paymentRef: req.params.reference,
+        amountPaid: data.amount,
+        confirmedVia: 'manual_verify',
+      });
+    } else if (data.status === 'failed' || data.status === 'abandoned') {
+      await markVoteFailed({
+        paymentRef: req.params.reference,
+        reason: data.gateway_response || data.status,
+        confirmedVia: 'manual_verify',
+      });
     }
-    res.json({ status });
+
+    res.json({ status: data.status });
   } catch (err) {
     console.error(err.response?.data || err.message);
     res.status(500).json({ error: 'Failed to verify transaction' });
   }
 });
 
-// Admin: reconcile pending payments — checks every 'pending' vote directly against Paystack
-// and updates its status. Fixes cases where the webhook never reached the backend even
-// though the payment actually succeeded on Paystack's side.
+// Admin: reconcile pending payments — checks every 'pending' vote directly against
+// Paystack. Kept as a manual backup button; the automatic job (src/jobs/reconcileJob.js)
+// is now the primary safety net, running every few minutes on its own.
 router.post('/admin/reconcile-pending', requireAdmin, async (req, res) => {
   try {
     const { rows: pendingVotes } = await pool.query(
-      `SELECT id, payment_ref FROM votes WHERE status = 'pending' ORDER BY created_at ASC`
+      `SELECT id, payment_ref, amount_paid FROM votes WHERE status = 'pending' ORDER BY created_at ASC`
     );
 
     const results = { checked: pendingVotes.length, confirmed: 0, stillPending: 0, failed: 0, errors: [] };
 
     for (const vote of pendingVotes) {
       try {
-        const paystackRes = await axios.get(
-          `https://api.paystack.co/transaction/verify/${vote.payment_ref}`,
-          { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` } }
-        );
-        const status = paystackRes.data.data.status;
+        const data = await paystack.verifyTransaction(vote.payment_ref);
 
-        if (status === 'success') {
-          await pool.query(`UPDATE votes SET status = 'success' WHERE id = $1`, [vote.id]);
+        if (data.status === 'success') {
+          await markVoteSuccess({ id: vote.id, amountPaid: data.amount, confirmedVia: 'reconcile_job' });
           results.confirmed++;
-        } else if (status === 'failed' || status === 'abandoned') {
-          await pool.query(`UPDATE votes SET status = 'failed' WHERE id = $1`, [vote.id]);
+        } else if (data.status === 'failed' || data.status === 'abandoned') {
+          await markVoteFailed({ id: vote.id, reason: data.gateway_response || data.status, confirmedVia: 'reconcile_job' });
           results.failed++;
         } else {
           results.stillPending++;
@@ -347,43 +186,14 @@ router.post('/admin/reconcile-pending', requireAdmin, async (req, res) => {
   }
 });
 
-// Admin: FULL reconciliation against Paystack's transaction list.
-// Unlike reconcile-pending (which only checks rows already in `votes` with
-// status='pending'), this pulls Paystack's actual transaction history and:
-//   - updates any row whose status doesn't match Paystack
-//   - inserts any transaction that's missing from `votes` entirely (using
-//     Paystack's stored metadata: nominee_id, vote_count)
-// This catches payments that succeeded on Paystack but never made it into
-// the database at all (e.g. if the initial insert failed silently).
+// Admin: FULL reconciliation against Paystack's transaction list. Pulls Paystack's actual
+// transaction history and updates/inserts anything out of sync — catches payments that
+// succeeded on Paystack but never made it into the database at all.
 router.post('/admin/reconcile-full', requireAdmin, async (req, res) => {
-  const results = {
-    fetchedFromPaystack: 0,
-    updated: 0,
-    inserted: 0,
-    skippedNoMetadata: 0,
-    unchanged: 0,
-    errors: [],
-  };
+  const results = { fetchedFromPaystack: 0, updated: 0, inserted: 0, skippedNoMetadata: 0, unchanged: 0, errors: [] };
 
   try {
-    let page = 1;
-    const perPage = 100;
-    let hasMore = true;
-    const transactions = [];
-
-    while (hasMore) {
-      const psRes = await axios.get('https://api.paystack.co/transaction', {
-        headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` },
-        params: { perPage, page },
-      });
-
-      const { data, meta } = psRes.data;
-      transactions.push(...data);
-
-      hasMore = meta.page < meta.pageCount;
-      page++;
-    }
-
+    const transactions = await paystack.listAllTransactions();
     results.fetchedFromPaystack = transactions.length;
 
     for (const txn of transactions) {
@@ -400,10 +210,11 @@ router.post('/admin/reconcile-full', requireAdmin, async (req, res) => {
 
         if (existing.length > 0) {
           if (existing[0].status !== psStatus) {
-            await pool.query(`UPDATE votes SET status = $1 WHERE id = $2`, [
-              psStatus,
-              existing[0].id,
-            ]);
+            if (psStatus === 'success') {
+              await markVoteSuccess({ id: existing[0].id, amountPaid: txn.amount, confirmedVia: 'reconcile_full' });
+            } else if (psStatus === 'failed') {
+              await markVoteFailed({ id: existing[0].id, reason: txn.gateway_response || psStatus, confirmedVia: 'reconcile_full' });
+            }
             results.updated++;
           } else {
             results.unchanged++;
@@ -424,17 +235,19 @@ router.post('/admin/reconcile-full', requireAdmin, async (req, res) => {
             continue;
           }
 
+          const feePercent = await getPlatformFeePercent();
+          const { platformFeeKobo, organizerPayoutKobo } = psStatus === 'success'
+            ? splitAmount(txn.amount, feePercent)
+            : { platformFeeKobo: 0, organizerPayoutKobo: 0 };
+
           await pool.query(
-            `INSERT INTO votes (nominee_id, voter_name, voter_phone, vote_count, amount_paid, payment_ref, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            `INSERT INTO votes (nominee_id, voter_name, voter_phone, vote_count, amount_paid, payment_ref, status, platform_fee_kobo, organizer_payout_kobo, confirmed_via, failure_reason)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
             [
-              nomineeId,
-              txn.customer?.first_name || null,
-              txn.customer?.phone || null,
-              voteCount,
-              txn.amount,
-              reference,
-              psStatus,
+              nomineeId, txn.customer?.first_name || null, txn.customer?.phone || null,
+              voteCount, txn.amount, reference, psStatus,
+              platformFeeKobo, organizerPayoutKobo, 'reconcile_full',
+              psStatus === 'failed' ? (txn.gateway_response || 'failed') : null,
             ]
           );
           results.inserted++;
@@ -444,6 +257,7 @@ router.post('/admin/reconcile-full', requireAdmin, async (req, res) => {
       }
     }
 
+    realtime.emitEarningsUpdate();
     res.json(results);
   } catch (err) {
     console.error('Full reconcile error:', err.response?.data || err.message);
@@ -465,6 +279,29 @@ router.get('/admin/all', requireAdmin, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch votes' });
+  }
+});
+
+// Admin: earnings + payment-health summary for the dashboard
+router.get('/admin/earnings-summary', requireAdmin, async (req, res) => {
+  try {
+    const { rows: totals } = await pool.query(`
+      SELECT
+        COALESCE(SUM(vote_count) FILTER (WHERE status = 'success'), 0)::int AS total_votes,
+        COALESCE(SUM(amount_paid) FILTER (WHERE status = 'success'), 0)::int AS total_collected_kobo,
+        COALESCE(SUM(organizer_payout_kobo) FILTER (WHERE status = 'success'), 0)::int AS organizer_earned_kobo,
+        COALESCE(SUM(platform_fee_kobo) FILTER (WHERE status = 'success'), 0)::int AS platform_fee_kobo,
+        COUNT(*) FILTER (WHERE status = 'success')::int AS confirmed_count,
+        COUNT(*) FILTER (WHERE status = 'pending')::int AS pending_count,
+        COUNT(*) FILTER (WHERE status = 'failed')::int AS failed_count
+      FROM votes
+    `);
+
+    const feePercent = await getPlatformFeePercent();
+    res.json({ ...totals[0], platform_fee_percent: feePercent });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch earnings summary' });
   }
 });
 

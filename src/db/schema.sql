@@ -24,6 +24,10 @@ CREATE TABLE IF NOT EXISTS votes (
   amount_paid INTEGER NOT NULL, -- in kobo
   payment_ref TEXT UNIQUE NOT NULL,
   status TEXT DEFAULT 'pending', -- pending | success | failed
+  failure_reason TEXT, -- populated when status = 'failed' (from Paystack's gateway_response)
+  platform_fee_kobo INTEGER NOT NULL DEFAULT 0,     -- locked in at confirmation time
+  organizer_payout_kobo INTEGER NOT NULL DEFAULT 0, -- locked in at confirmation time
+  confirmed_via TEXT, -- 'webhook' | 'manual_verify' | 'reconcile_job' | 'reconcile_full' — for debugging/audit
   created_at TIMESTAMP DEFAULT now()
 );
 
@@ -34,6 +38,9 @@ CREATE TABLE IF NOT EXISTS settings (
 
 INSERT INTO settings (key, value) VALUES ('price_per_vote_kobo', '10000')
   ON CONFLICT (key) DO NOTHING; -- ₦100 per vote default
+
+INSERT INTO settings (key, value) VALUES ('platform_fee_percent', '30')
+  ON CONFLICT (key) DO NOTHING; -- ProxAfrica's cut, configurable via admin
 
 CREATE INDEX IF NOT EXISTS idx_nominees_category ON nominees(category_id);
 CREATE INDEX IF NOT EXISTS idx_votes_nominee ON votes(nominee_id);

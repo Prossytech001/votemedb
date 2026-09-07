@@ -33,4 +33,36 @@ router.patch('/price-per-vote', requireAdmin, async (req, res) => {
   }
 });
 
+// Public: current platform fee % (so the frontend can show "₦30 of every ₦100 goes to ProxAfrica")
+router.get('/platform-fee', async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT value FROM settings WHERE key = 'platform_fee_percent'");
+    const percent = rows.length ? parseFloat(rows[0].value) : 30;
+    res.json({ platform_fee_percent: percent });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch platform fee' });
+  }
+});
+
+// Admin: update platform fee % — only affects votes confirmed AFTER this change;
+// past votes keep the split that was locked in at the time they were confirmed.
+router.patch('/platform-fee', requireAdmin, async (req, res) => {
+  const { fee_percent } = req.body;
+  if (fee_percent === undefined || fee_percent < 0 || fee_percent > 100) {
+    return res.status(400).json({ error: 'fee_percent required, must be between 0 and 100' });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO settings (key, value) VALUES ('platform_fee_percent', $1)
+       ON CONFLICT (key) DO UPDATE SET value = $1`,
+      [fee_percent.toString()]
+    );
+    res.json({ platform_fee_percent: fee_percent });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update platform fee' });
+  }
+});
+
 module.exports = router;
