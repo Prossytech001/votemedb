@@ -68,26 +68,36 @@ router.post('/initiate', async (req, res) => {
     const reference = `vote_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
 
     // Record a pending vote row first so we never lose track of the attempt
-    await pool.query(
+    const { rows: inserted } = await pool.query(
       `INSERT INTO votes (nominee_id, voter_name, voter_phone, vote_count, amount_paid, payment_ref, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending') RETURNING id`,
       [nominee_id, voter_name || null, voter_phone || null, vote_count, amount, reference]
     );
 
-    const { authorization_url, access_code } = await paystack.initializeTransaction({
-      email: voter_email,
-      amount,
-      reference,
-      callback_url: `${process.env.FRONTEND_URL}/payment-success`,
-      metadata: { nominee_id, vote_count },
-    });
+    try {
+      const { authorization_url, access_code } = await paystack.initializeTransaction({
+        email: voter_email,
+        amount,
+        reference,
+        callback_url: `${process.env.FRONTEND_URL}/payment-success`,
+        metadata: { nominee_id, vote_count },
+      });
 
-    res.json({ authorization_url, access_code, reference });
+      res.json({ authorization_url, access_code, reference });
+    } catch (err) {
+      await pool.query(
+        `UPDATE votes SET status = 'failed', failure_reason = $1 WHERE id = $2`,
+        ['Paystack init failed', inserted[0].id]
+      );
+      console.error(err.response?.data || err.message);
+      res.status(500).json({ error: 'Failed to initiate payment' });
+    }
   } catch (err) {
     console.error(err.response?.data || err.message);
     res.status(500).json({ error: 'Failed to initiate payment' });
   }
 });
+
 
 // Paystack webhook: primary, real-time confirmation path.
 // IMPORTANT: configure this exact URL in your Paystack dashboard webhook settings
