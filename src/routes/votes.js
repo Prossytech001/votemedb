@@ -275,6 +275,64 @@ router.post('/admin/reconcile-full', requireAdmin, async (req, res) => {
   }
 });
 
+
+// Admin: manually credit votes to a nominee — no Paystack transaction involved.
+// Counts toward public vote totals/percentages, but flagged as is_manual_credit
+// so it's excluded from real revenue figures and always visible as non-paid.
+router.post('/admin/manual-credit', requireAdmin, async (req, res) => {
+  const { nominee_id, vote_count, reason } = req.body;
+  const creditedBy = req.admin?.username || req.admin?.email || 'admin';
+
+  if (!nominee_id || !vote_count || vote_count < 1) {
+    return res.status(400).json({ error: 'nominee_id and vote_count (>=1) are required' });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO votes (
+         nominee_id, vote_count, amount_paid, payment_ref, status,
+         confirmed_via, is_manual_credit, credited_by, credit_reason
+       )
+       VALUES ($1, $2, 0, $3, 'success', 'manual_admin_credit', true, $4, $5)
+       RETURNING *`,
+      [
+        nominee_id,
+        vote_count,
+        `manual_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+        creditedBy,
+        reason || null,
+      ]
+    );
+
+    realtime.emitVoteUpdate(rows[0]);
+    // Deliberately NOT calling emitEarningsUpdate() — this isn't revenue.
+
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to credit votes' });
+  }
+});
+
+// Admin: list manual credits separately, so it's always easy to audit
+// which votes were paid for vs. manually added.
+router.get('/admin/manual-credits', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT v.*, n.name AS nominee_name, c.name AS category_name
+      FROM votes v
+      JOIN nominees n ON n.id = v.nominee_id
+      JOIN categories c ON c.id = n.category_id
+      WHERE v.is_manual_credit = true
+      ORDER BY v.created_at DESC
+    `);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch manual credits' });
+  }
+});
+
 // Admin: view all vote transactions
 router.get('/admin/all', requireAdmin, async (req, res) => {
   try {
@@ -298,10 +356,11 @@ router.get('/admin/earnings-summary', requireAdmin, async (req, res) => {
     const { rows: totals } = await pool.query(`
       SELECT
         COALESCE(SUM(vote_count) FILTER (WHERE status = 'success'), 0)::int AS total_votes,
-        COALESCE(SUM(amount_paid) FILTER (WHERE status = 'success'), 0)::int AS total_collected_kobo,
-        COALESCE(SUM(organizer_payout_kobo) FILTER (WHERE status = 'success'), 0)::int AS organizer_earned_kobo,
-        COALESCE(SUM(platform_fee_kobo) FILTER (WHERE status = 'success'), 0)::int AS platform_fee_kobo,
-        COUNT(*) FILTER (WHERE status = 'success')::int AS confirmed_count,
+        COALESCE(SUM(vote_count) FILTER (WHERE status = 'success' AND is_manual_credit = true), 0)::int AS manual_credited_votes,
+        COALESCE(SUM(amount_paid) FILTER (WHERE status = 'success' AND is_manual_credit = false), 0)::int AS total_collected_kobo,
+        COALESCE(SUM(organizer_payout_kobo) FILTER (WHERE status = 'success' AND is_manual_credit = false), 0)::int AS organizer_earned_kobo,
+        COALESCE(SUM(platform_fee_kobo) FILTER (WHERE status = 'success' AND is_manual_credit = false), 0)::int AS platform_fee_kobo,
+        COUNT(*) FILTER (WHERE status = 'success' AND is_manual_credit = false)::int AS confirmed_count,
         COUNT(*) FILTER (WHERE status = 'pending')::int AS pending_count,
         COUNT(*) FILTER (WHERE status = 'failed')::int AS failed_count
       FROM votes
@@ -312,6 +371,30 @@ router.get('/admin/earnings-summary', requireAdmin, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch earnings summary' });
+  }
+});
+
+// Admin: permanently delete a single vote/transaction — removes it from
+// vote counts, revenue totals, and the transactions list entirely.
+router.delete('/admin/:id', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `DELETE FROM votes WHERE id = $1 RETURNING *`,
+      [req.params.id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Vote not found' });
+    }
+
+    // Let connected dashboards/results refresh immediately
+    realtime.emitVoteUpdate({ ...rows[0], status: 'deleted' });
+    realtime.emitEarningsUpdate();
+
+    res.json({ deleted: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete vote' });
   }
 });
 
